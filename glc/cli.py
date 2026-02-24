@@ -1,0 +1,221 @@
+import os
+from pathlib import Path
+from urllib.parse import urlparse, quote
+
+import requests
+import typer
+
+app = typer.Typer(help="Manage GitLab CI/CD variables")
+
+
+def die(msg: str) -> None:
+    typer.echo(typer.style("error: ", fg=typer.colors.RED, bold=True) + msg, err=True)
+    raise typer.Exit(1)
+
+
+def ok(msg: str) -> None:
+    typer.echo(typer.style("✓ ", fg=typer.colors.GREEN, bold=True) + msg)
+
+
+def handle_http_error(e: requests.HTTPError) -> None:
+    status = e.response.status_code
+    messages = {
+        401: "unauthorized — check your GITLAB_TOKEN",
+        403: "forbidden — token lacks required permissions",
+        404: "not found — variable or project does not exist",
+    }
+    detail = messages.get(status, f"HTTP {status}")
+    die(detail)
+
+
+def find_gitlab_file() -> Path:
+    result = _find_gitlab_file_or_none()
+    if result is None:
+        die(".gitlab file not found in current or any parent directory")
+    return result
+
+
+def parse_repo_url(gitlab_file: Path) -> tuple[str, str]:
+    """Returns (api_base_url, url-encoded project path)."""
+    url = gitlab_file.read_text().strip()
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        die(f".gitlab contains invalid URL: {url!r}")
+    host = f"{parsed.scheme}://{parsed.netloc}"
+    project_path = parsed.path.lstrip("/")
+    if project_path.endswith(".git"):
+        project_path = project_path[:-4]
+    return f"{host}/api/v4", quote(project_path, safe="")
+
+
+def get_token() -> str:
+    token = os.environ.get("GITLAB_TOKEN")
+    if not token:
+        die("GITLAB_TOKEN environment variable is not set")
+    return token
+
+
+def api_headers(token: str) -> dict:
+    return {"PRIVATE-TOKEN": token}
+
+
+CACHE_FILE = ".glc-cache"
+
+
+def _read_cache(gitlab_file: Path) -> list[str]:
+    cache = gitlab_file.parent / CACHE_FILE
+    if not cache.exists():
+        return []
+    return [line for line in cache.read_text().splitlines() if line.strip()]
+
+
+def _write_cache(gitlab_file: Path, keys: list[str]) -> None:
+    cache = gitlab_file.parent / CACHE_FILE
+    cache.write_text("\n".join(sorted(keys)) + "\n")
+
+
+def _complete_gitlab_keys(ctx, args, incomplete: str) -> list[str]:
+    """Shell completion: read variable keys from local cache."""
+    try:
+        gitlab_file = _find_gitlab_file_or_none()
+        if not gitlab_file:
+            return []
+        keys = _read_cache(gitlab_file)
+        return [k for k in keys if k.startswith(incomplete)]
+    except BaseException:
+        return []
+
+
+def _complete_local_envs(ctx, args, incomplete: str) -> list[str]:
+    """Shell completion: list local .env files."""
+    try:
+        gitlab_file = _find_gitlab_file_or_none()
+        if not gitlab_file:
+            return []
+        keys = [f.stem for f in sorted(gitlab_file.parent.glob("*.env"))]
+        return [k for k in keys if k.startswith(incomplete)]
+    except BaseException:
+        return []
+
+
+def _find_gitlab_file_or_none() -> Path | None:
+    current = Path.cwd()
+    while True:
+        candidate = current / ".gitlab"
+        if candidate.exists():
+            return candidate
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
+@app.command(name="list")
+def list_vars():
+    """List all variable keys in the GitLab project."""
+    gitlab_file = find_gitlab_file()
+    api_base, project = parse_repo_url(gitlab_file)
+    headers = api_headers(get_token())
+
+    try:
+        keys = []
+        page = 1
+        while True:
+            resp = requests.get(
+                f"{api_base}/projects/{project}/variables",
+                headers=headers,
+                params={"per_page": 100, "page": page},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                break
+            keys.extend(var["key"] for var in data)
+            if len(data) < 100:
+                break
+            page += 1
+    except requests.HTTPError as e:
+        handle_http_error(e)
+    except requests.ConnectionError:
+        die(f"could not connect to {api_base}")
+
+    if not keys:
+        typer.echo("no variables found")
+        return
+
+    _write_cache(gitlab_file, keys)
+    for key in sorted(keys):
+        typer.echo(key)
+
+
+@app.command()
+def pull(env_name: str = typer.Argument(..., help="Variable key in GitLab (e.g. VN-APP-PROD-01)", autocompletion=_complete_gitlab_keys)):
+    """Pull a file-type variable from GitLab and write it to a local file."""
+    gitlab_file = find_gitlab_file()
+    api_base, project = parse_repo_url(gitlab_file)
+    headers = api_headers(get_token())
+
+    try:
+        resp = requests.get(
+            f"{api_base}/projects/{project}/variables/{env_name}",
+            headers=headers,
+        )
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        handle_http_error(e)
+    except requests.ConnectionError:
+        die(f"could not connect to {api_base}")
+
+    value = resp.json()["value"]
+    env_file = gitlab_file.parent / f"{env_name}.env"
+    env_file.write_text(value)
+    ok(f"pulled {env_name} -> {env_file.name}")
+
+
+@app.command()
+def push(env_name: str = typer.Argument(..., help="Variable key in GitLab (e.g. VN-APP-PROD-01)", autocompletion=_complete_local_envs)):
+    """Push a local file to GitLab as a file-type variable (create or update)."""
+    gitlab_file = find_gitlab_file()
+    api_base, project = parse_repo_url(gitlab_file)
+    headers = api_headers(get_token())
+
+    env_file = gitlab_file.parent / f"{env_name}.env"
+    if not env_file.exists():
+        die(f"{env_name}.env not found")
+
+    value = env_file.read_text()
+
+    try:
+        check = requests.get(
+            f"{api_base}/projects/{project}/variables/{env_name}",
+            headers=headers,
+        )
+
+        if check.status_code == 200:
+            requests.put(
+                f"{api_base}/projects/{project}/variables/{env_name}",
+                headers=headers,
+                json={"value": value, "variable_type": "file"},
+            ).raise_for_status()
+            ok(f"updated {env_name}")
+        elif check.status_code == 404:
+            requests.post(
+                f"{api_base}/projects/{project}/variables",
+                headers=headers,
+                json={"key": env_name, "value": value, "variable_type": "file"},
+            ).raise_for_status()
+            ok(f"created {env_name}")
+        else:
+            check.raise_for_status()
+    except requests.HTTPError as e:
+        handle_http_error(e)
+    except requests.ConnectionError:
+        die(f"could not connect to {api_base}")
+
+
+def main():
+    app()
+
+
+if __name__ == "__main__":
+    main()
