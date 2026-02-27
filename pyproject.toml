@@ -4,10 +4,7 @@ version = "0.1.0"
 description = "GitLab CI/CD variables manager"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = [
-    "typer",
-    "requests",
-]
+dependencies = ["typer", "requests"]
 
 [project.scripts]
 glc = "glc.cli:main"
@@ -18,3 +15,15 @@ package = true
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+
+[tool.bumpversion]
+current_version = "0.1.0"
+commit = true
+tag = true
+message = "Bump version: {current_version} → {new_version}"
+
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
