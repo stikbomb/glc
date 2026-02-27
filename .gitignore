@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# glc runtime files
+.glc-cache
+.glc-backups/
+*.env

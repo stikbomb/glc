@@ -1,4 +1,6 @@
+import difflib
 import os
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, quote
 
@@ -172,8 +174,41 @@ def pull(env_name: str = typer.Argument(..., help="Variable key in GitLab (e.g. 
     ok(f"pulled {env_name} -> {env_file.name}")
 
 
+def _save_backup(gitlab_file: Path, env_name: str, value: str) -> Path:
+    backup_dir = gitlab_file.parent / ".glc-backups"
+    backup_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_file = backup_dir / f"{env_name}.env.{timestamp}"
+    backup_file.write_text(value)
+    return backup_file
+
+
+def _show_diff(old: str, new: str, env_name: str) -> bool:
+    """Print colored unified diff. Returns True if there are changes."""
+    diff = list(difflib.unified_diff(
+        old.splitlines(keepends=True),
+        new.splitlines(keepends=True),
+        fromfile=f"{env_name} (remote)",
+        tofile=f"{env_name} (local)",
+    ))
+    if not diff:
+        return False
+    for line in diff:
+        line = line.rstrip()
+        if line.startswith("+") and not line.startswith("+++"):
+            typer.echo(typer.style(line, fg=typer.colors.GREEN))
+        elif line.startswith("-") and not line.startswith("---"):
+            typer.echo(typer.style(line, fg=typer.colors.RED))
+        else:
+            typer.echo(line)
+    return True
+
+
 @app.command()
-def push(env_name: str = typer.Argument(..., help="Variable key in GitLab (e.g. VN-APP-PROD-01)", autocompletion=_complete_local_envs)):
+def push(
+    env_name: str = typer.Argument(..., help="Variable key in GitLab (e.g. VN-APP-PROD-01)", autocompletion=_complete_local_envs),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+):
     """Push a local file to GitLab as a file-type variable (create or update)."""
     gitlab_file = find_gitlab_file()
     api_base, project = parse_repo_url(gitlab_file)
@@ -183,7 +218,7 @@ def push(env_name: str = typer.Argument(..., help="Variable key in GitLab (e.g. 
     if not env_file.exists():
         die(f"{env_name}.env not found")
 
-    value = env_file.read_text()
+    local_value = env_file.read_text()
 
     try:
         check = requests.get(
@@ -192,17 +227,34 @@ def push(env_name: str = typer.Argument(..., help="Variable key in GitLab (e.g. 
         )
 
         if check.status_code == 200:
+            remote_value = check.json()["value"]
+            has_changes = _show_diff(remote_value, local_value, env_name)
+
+            if not has_changes:
+                ok(f"{env_name} is already up to date")
+                return
+
+            if not yes and not typer.confirm("\npush these changes?"):
+                typer.echo("aborted")
+                raise typer.Exit(0)
+
+            backup = _save_backup(gitlab_file, env_name, remote_value)
             requests.put(
                 f"{api_base}/projects/{project}/variables/{env_name}",
                 headers=headers,
-                json={"value": value, "variable_type": "file"},
+                json={"value": local_value, "variable_type": "file"},
             ).raise_for_status()
-            ok(f"updated {env_name}")
+            ok(f"updated {env_name}  (backup saved to {backup.name})")
+
         elif check.status_code == 404:
+            if not yes and not typer.confirm(f"create new variable {env_name}?"):
+                typer.echo("aborted")
+                raise typer.Exit(0)
+
             requests.post(
                 f"{api_base}/projects/{project}/variables",
                 headers=headers,
-                json={"key": env_name, "value": value, "variable_type": "file"},
+                json={"key": env_name, "value": local_value, "variable_type": "file"},
             ).raise_for_status()
             ok(f"created {env_name}")
         else:
