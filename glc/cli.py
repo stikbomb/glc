@@ -374,6 +374,14 @@ def push(
         die(f"could not connect to {api_base}")
 
 
+@app.command()
+def ui():
+    """Launch interactive TUI."""
+    from glc.tui import GlcApp
+
+    GlcApp().run()
+
+
 def main():
     app()
 
