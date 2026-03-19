@@ -62,6 +62,58 @@ def api_headers(token: str) -> dict:
 
 
 CACHE_FILE = ".glc-cache"
+TEMPLATE_FILE = ".glc-template.env"
+
+
+def _parse_template(template_path: Path) -> list[str]:
+    """Returns keys from the template in order (skips comments and blank lines)."""
+    keys = []
+    for line in template_path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            key = line.split("=", 1)[0]
+            keys.append(key)
+    return keys
+
+
+def _parse_env_dict(env_path: Path) -> dict[str, str]:
+    """Returns {KEY: 'KEY=value'} for non-comment, non-blank lines."""
+    result = {}
+    for line in env_path.read_text().splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            key = stripped.split("=", 1)[0]
+            result[key] = stripped
+    return result
+
+
+def _reorder_env(env_path: Path, template_keys: list[str]) -> str:
+    """Returns env content with keys ordered as in the template; extras appended."""
+    env_dict = _parse_env_dict(env_path)
+    ordered = []
+    for key in template_keys:
+        if key in env_dict:
+            ordered.append(env_dict[key])
+    template_set = set(template_keys)
+    extra = [line for key, line in env_dict.items() if key not in template_set]
+    if extra:
+        ordered.extend(extra)
+    return "\n".join(ordered) + "\n"
+
+
+def _lint_env(env_path: Path, template_keys: list[str]) -> tuple[list[str], list[str]]:
+    """Returns (missing, extra) keys relative to the template."""
+    env_keys = set(_parse_env_dict(env_path).keys())
+    template_set = set(template_keys)
+    missing = [k for k in template_keys if k not in env_keys]
+    extra = sorted(env_keys - template_set)
+    return missing, extra
+
+
+def _find_template(gitlab_file: Path) -> Path | None:
+    """Returns .glc-template.env next to .gitlab, or None."""
+    candidate = gitlab_file.parent / TEMPLATE_FILE
+    return candidate if candidate.exists() else None
 
 
 def _read_cache(gitlab_file: Path) -> list[str]:
@@ -174,6 +226,47 @@ def pull(env_name: str = typer.Argument(..., help="Variable key in GitLab (e.g. 
     ok(f"pulled {env_name} -> {env_file.name}")
 
 
+@app.command()
+def lint(
+    env_name: str = typer.Argument(None, help="Variable key (e.g. VN-APP-PROD-01); omit to check all *.env files", autocompletion=_complete_local_envs),
+):
+    """Lint local .env file(s) against the template."""
+    gitlab_file = find_gitlab_file()
+    template_path = _find_template(gitlab_file)
+    if template_path is None:
+        die(f"{TEMPLATE_FILE} not found next to .gitlab")
+
+    template_keys = _parse_template(template_path)
+
+    if env_name:
+        env_files = [gitlab_file.parent / f"{env_name}.env"]
+        if not env_files[0].exists():
+            die(f"{env_name}.env not found")
+    else:
+        env_files = sorted(gitlab_file.parent.glob("*.env"))
+        if not env_files:
+            typer.echo("no .env files found")
+            return
+
+    any_missing = False
+    for env_file in env_files:
+        missing, extra = _lint_env(env_file, template_keys)
+        name = env_file.stem
+        if not missing and not extra:
+            ok(f"{name}: ok")
+            continue
+        typer.echo(typer.style(f"{name}:", bold=True))
+        for key in missing:
+            typer.echo(typer.style(f"  missing: {key}", fg=typer.colors.RED))
+        for key in extra:
+            typer.echo(typer.style(f"  extra:   {key}", fg=typer.colors.YELLOW))
+        if missing:
+            any_missing = True
+
+    if any_missing:
+        raise typer.Exit(1)
+
+
 def _save_backup(gitlab_file: Path, env_name: str, value: str) -> Path:
     backup_dir = gitlab_file.parent / ".glc-backups"
     backup_dir.mkdir(exist_ok=True)
@@ -219,6 +312,22 @@ def push(
         die(f"{env_name}.env not found")
 
     local_value = env_file.read_text()
+
+    template_path = _find_template(gitlab_file)
+    if template_path is not None:
+        template_keys = _parse_template(template_path)
+        missing, extra = _lint_env(env_file, template_keys)
+        if missing:
+            typer.echo(typer.style("warning: ", fg=typer.colors.YELLOW, bold=True) + "missing keys in " + env_file.name + ":")
+            for key in missing:
+                typer.echo(f"  {key}")
+            if not yes and not typer.confirm("continue anyway?"):
+                typer.echo("aborted")
+                raise typer.Exit(0)
+        reordered = _reorder_env(env_file, template_keys)
+        if reordered != local_value:
+            env_file.write_text(reordered)
+            local_value = reordered
 
     try:
         check = requests.get(
