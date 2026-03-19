@@ -13,7 +13,7 @@ from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widget import Widget
-from textual.widgets import Button, Footer, Header, Label, ListItem, ListView, RichLog, Static, TextArea
+from textual.widgets import Button, Footer, Header, Label, RichLog, Static, TextArea, Tree
 
 
 # ─── Sync-aware RichLog ───────────────────────────────────────────────────────
@@ -126,23 +126,85 @@ class EditModal(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-# ─── Env List Pane ───────────────────────────────────────────────────────────
+# ─── File Tree Pane ──────────────────────────────────────────────────────────
 
 
-class EnvListPane(Widget):
+class FileTreePane(Widget):
     def compose(self) -> ComposeResult:
-        yield Label(".env files", id="env-list-title")
-        yield ListView(id="env-list")
+        yield Tree(".", id="file-tree")
 
-    def update_list(self, env_files: list[Path]) -> None:
-        lv = self.query_one(ListView)
-        lv.clear()
-        for f in env_files:
-            lv.append(ListItem(Label(f.stem), name=f.stem))
+    def on_mount(self) -> None:
+        self.load_from(Path.cwd())
 
-    def show_message(self, text: str) -> None:
-        self.query_one(ListView).clear()
-        self.query_one("#env-list-title", Label).update(text)
+    def load_from(self, root: Path) -> None:
+        tree = self.query_one(Tree)
+        tree.clear()
+        tree.root.set_label(root.name or str(root))
+        tree.root.data = root
+        gitlab_dirs = self._find_gitlab_dirs(root)
+        if not gitlab_dirs:
+            tree.root.add_leaf("(no projects found)")
+            tree.root.expand()
+            return
+        self._build(tree.root, root, gitlab_dirs)
+        tree.root.expand()
+
+    # ── scanning ─────────────────────────────────────────────────────────────
+
+    def _find_gitlab_dirs(self, root: Path, max_depth: int = 6) -> list[Path]:
+        result: list[Path] = []
+        if (root / ".gitlab").exists():
+            result.append(root)
+
+        def scan(path: Path, depth: int) -> None:
+            if depth == 0:
+                return
+            try:
+                for child in sorted(path.iterdir()):
+                    if child.is_dir() and not child.name.startswith("."):
+                        if (child / ".gitlab").exists():
+                            result.append(child)
+                        scan(child, depth - 1)
+            except PermissionError:
+                pass
+
+        scan(root, max_depth)
+        return result
+
+    # ── tree building ─────────────────────────────────────────────────────────
+
+    def _build(self, root_node: object, root: Path, gitlab_dirs: list[Path]) -> None:
+        # Collect relative paths: project dirs + every ancestor up to root
+        needed: set[Path] = set()
+        for gd in gitlab_dirs:
+            try:
+                rel = gd.relative_to(root)
+                needed.add(rel)
+                for anc in rel.parents:
+                    if anc != Path("."):
+                        needed.add(anc)
+            except ValueError:
+                pass
+
+        node_map: dict[Path, object] = {Path("."): root_node}
+
+        for rel in sorted(needed, key=lambda p: len(p.parts)):
+            if rel == Path("."):
+                # root itself is a project dir — add envs directly, don't create a child node
+                self._add_envs(root_node, root)  # type: ignore[arg-type]
+                continue
+            abs_path = root / rel
+            parent = node_map.get(rel.parent)
+            if parent is None:
+                continue
+            node = parent.add(rel.name, data=abs_path)  # type: ignore[union-attr]
+            node_map[rel] = node
+            if (abs_path / ".gitlab").exists():
+                self._add_envs(node, abs_path)
+
+    def _add_envs(self, node: object, project_dir: Path) -> None:
+        for env_file in sorted(project_dir.glob("*.env")):
+            node.add_leaf(env_file.stem, data=env_file)  # type: ignore[union-attr]
 
 
 # ─── Diff Pane ───────────────────────────────────────────────────────────────
@@ -306,15 +368,13 @@ class GlcApp(App):
         height: 1fr;
     }
 
-    EnvListPane {
-        width: 22;
+    FileTreePane {
+        width: 26;
         border-right: solid $accent;
-        padding: 0 1;
     }
 
-    #env-list-title {
-        padding: 0 0 1 0;
-        text-style: bold;
+    #file-tree {
+        padding: 0 1;
     }
 
     DiffPane {
@@ -442,33 +502,27 @@ class GlcApp(App):
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="main"):
-            yield EnvListPane(id="env-list-pane")
+            yield FileTreePane(id="file-tree-pane")
             yield DiffPane(id="diff-pane")
         yield Footer()
 
     def on_mount(self) -> None:
-        self._load_env_list()
+        pass  # FileTreePane loads itself on mount
 
-    def _load_env_list(self) -> None:
-        self._gitlab_file = self._find_file()
-        pane = self.query_one(EnvListPane)
-        if self._gitlab_file is None:
-            pane.show_message("[red].gitlab not found[/red]")
+    def on_tree_node_highlighted(self, event: Tree.NodeHighlighted) -> None:
+        node = event.node
+        if not isinstance(node.data, Path) or node.data.is_dir():
             return
-        env_files = sorted(self._gitlab_file.parent.glob("*.env"))
-        if not env_files:
-            pane.show_message("[yellow]no .env files[/yellow]")
+        env_file: Path = node.data
+        gitlab_file = env_file.parent / ".gitlab"
+        if not gitlab_file.exists():
             return
-        pane.update_list(env_files)
-
-    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
-        if event.item is None:
-            return
-        env_name = event.item.name
-        if not env_name:
-            return
-        self._current_env = env_name
-        self._load_diff(env_name)
+        if gitlab_file != self._gitlab_file:
+            self._remote_cache.clear()
+            self._area_env = None
+            self._gitlab_file = gitlab_file
+        self._current_env = env_file.stem
+        self._load_diff(env_file.stem)
 
     def _load_diff(self, env_name: str) -> None:
         if env_name in self._remote_cache:
@@ -661,6 +715,6 @@ class GlcApp(App):
 
     def action_refresh(self) -> None:
         self._remote_cache.clear()
-        self._load_env_list()
+        self.query_one(FileTreePane).load_from(Path.cwd())
         if self._current_env:
             self._load_diff(self._current_env)
