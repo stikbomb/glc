@@ -8,6 +8,7 @@ dependencies = [
     "typer",
     "requests",
     "textual",
+    "bump-my-version>=1.2.7",
 ]
 
 [project.scripts]
