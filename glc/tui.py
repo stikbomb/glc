@@ -13,7 +13,24 @@ from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widget import Widget
-from textual.widgets import Button, Footer, Header, Label, ListItem, ListView, RichLog, Static
+from textual.widgets import Button, Footer, Header, Label, ListItem, ListView, RichLog, Static, TextArea
+
+
+# ─── Sync-aware RichLog ───────────────────────────────────────────────────────
+
+
+class SyncableLog(RichLog):
+    """RichLog that posts a Scrolled message when scroll_y changes."""
+
+    class Scrolled(Message):
+        def __init__(self, log: "SyncableLog", y: float) -> None:
+            super().__init__()
+            self.log = log
+            self.y = y
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_y(old_value, new_value)
+        self.post_message(self.Scrolled(self, new_value))
 
 
 # ─── Messages ────────────────────────────────────────────────────────────────
@@ -78,6 +95,37 @@ class ConfirmModal(ModalScreen[bool]):
         self.dismiss(False)
 
 
+# ─── Edit Modal ──────────────────────────────────────────────────────────────
+
+
+class EditModal(ModalScreen[str | None]):
+    BINDINGS = [
+        Binding("ctrl+s", "save", "Save"),
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, content: str, env_name: str) -> None:
+        super().__init__()
+        self._content = content
+        self._env_name = env_name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="edit-dialog"):
+            yield Label(f"  {self._env_name}.env  [ctrl+s] save  [esc] cancel", id="edit-title")
+            yield TextArea(id="edit-area")
+
+    def on_mount(self) -> None:
+        area = self.query_one("#edit-area", TextArea)
+        area.load_text(self._content)
+        area.focus()
+
+    def action_save(self) -> None:
+        self.dismiss(self.query_one("#edit-area", TextArea).text)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ─── Env List Pane ───────────────────────────────────────────────────────────
 
 
@@ -104,23 +152,52 @@ class DiffPane(Widget):
     def compose(self) -> ComposeResult:
         with Horizontal(id="diff-cols-header"):
             yield Label("  LOCAL", id="local-title")
+            yield Label("", id="center-header")
             yield Label("  REMOTE", id="remote-title")
         with Horizontal(id="diff-cols"):
-            yield RichLog(id="local-log", highlight=False, markup=True)
-            yield RichLog(id="remote-log", highlight=False, markup=True)
-        with Horizontal(id="diff-actions"):
-            yield Button("→ push", id="push-btn", variant="success", disabled=True)
-            yield Button("← pull", id="pull-btn", variant="primary", disabled=True)
-            yield Button("⟳ reload", id="reload-btn", variant="default")
+            yield SyncableLog(id="local-log", highlight=False, markup=True)
+            with Vertical(id="diff-actions"):
+                yield Static("●", id="sync-lamp")
+                yield Button("→ push", id="push-btn", variant="success", disabled=True)
+                yield Button("← pull", id="pull-btn", variant="primary", disabled=True)
+                yield Button("✎ edit", id="edit-btn", variant="default")
+                yield Button("⇕ sync", id="sync-btn", variant="default")
+                yield Button("⟳ reload", id="reload-btn", variant="default")
+            yield SyncableLog(id="remote-log", highlight=False, markup=True)
         yield Static("", id="diff-status")
 
-    @property
-    def _local(self) -> RichLog:
-        return self.query_one("#local-log", RichLog)
+    _sync_scroll: bool = False
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self._sync_pending: dict[int, int] = {}
 
     @property
-    def _remote(self) -> RichLog:
-        return self.query_one("#remote-log", RichLog)
+    def _local(self) -> SyncableLog:
+        return self.query_one("#local-log", SyncableLog)
+
+    @property
+    def _remote(self) -> SyncableLog:
+        return self.query_one("#remote-log", SyncableLog)
+
+    def on_syncable_log_scrolled(self, event: SyncableLog.Scrolled) -> None:
+        if not self._sync_scroll:
+            return
+        log_id = id(event.log)
+        pending = self._sync_pending.get(log_id, 0)
+        if pending > 0:
+            self._sync_pending[log_id] = pending - 1
+            return
+        target = self._remote if event.log is self._local else self._local
+        target_id = id(target)
+        self._sync_pending[target_id] = self._sync_pending.get(target_id, 0) + 1
+        target.scroll_to(y=event.y, animate=False, immediate=True)
+
+    def toggle_sync(self) -> None:
+        self._sync_scroll = not self._sync_scroll
+        self.query_one("#sync-btn", Button).variant = (
+            "success" if self._sync_scroll else "error"
+        )
 
     def show_loading(self) -> None:
         self._local.clear()
@@ -131,7 +208,10 @@ class DiffPane(Widget):
         self.query_one("#pull-btn", Button).disabled = True
         self.query_one("#diff-status", Static).update("")
 
-    def show_diff(self, local_text: str, remote_text: str) -> None:
+    def show_diff(self, local_text: str, remote_text: str, preserve_scroll: bool = False) -> None:
+        local_y = self._local.scroll_y if preserve_scroll else 0
+        remote_y = self._remote.scroll_y if preserve_scroll else 0
+
         self._local.loading = False
         self._remote.loading = False
         self._local.clear()
@@ -150,13 +230,11 @@ class DiffPane(Widget):
                     self._local.write(line)
                     self._remote.write(line)
             elif tag == "delete":
-                # present locally, absent remotely
                 for line in a[i1:i2]:
                     self._local.write(f"[green]+{line}[/green]")
                     self._remote.write("")
                 n_added += i2 - i1
             elif tag == "insert":
-                # absent locally, present remotely
                 for line in b[j1:j2]:
                     self._local.write("")
                     self._remote.write(f"[red]-{line}[/red]")
@@ -179,6 +257,9 @@ class DiffPane(Widget):
         has_diff = n_added > 0 or n_removed > 0
         self.query_one("#push-btn", Button).disabled = not has_diff
         self.query_one("#pull-btn", Button).disabled = not has_diff
+        self.query_one("#sync-lamp", Static).update(
+            "[red]●[/red]" if has_diff else "[green]●[/green]"
+        )
 
         if has_diff:
             parts = []
@@ -190,11 +271,18 @@ class DiffPane(Widget):
         else:
             self.query_one("#diff-status", Static).update("  up to date")
 
+        if preserve_scroll:
+            if local_y:
+                self._local.scroll_to(y=local_y, animate=False)
+            if remote_y:
+                self._remote.scroll_to(y=remote_y, animate=False)
+
     def show_error(self, text: str) -> None:
         self._local.loading = False
         self._remote.loading = False
         self._local.clear()
         self._remote.clear()
+        self.query_one("#sync-lamp", Static).update("[red]●[/red]")
         self.query_one("#diff-status", Static).update(f"  [red]{text}[/red]")
         self.query_one("#push-btn", Button).disabled = True
         self.query_one("#pull-btn", Button).disabled = True
@@ -243,13 +331,16 @@ class GlcApp(App):
         text-style: bold;
     }
 
+    #center-header {
+        width: 14;
+    }
+
     #diff-cols {
         height: 1fr;
     }
 
     #local-log {
         width: 1fr;
-        border-right: solid $accent;
     }
 
     #remote-log {
@@ -257,13 +348,23 @@ class GlcApp(App):
     }
 
     #diff-actions {
-        height: 3;
+        width: 14;
+        border-left: solid $accent;
+        border-right: solid $accent;
         align: center middle;
-        padding: 0 1;
+        padding: 1 0;
+    }
+
+    #sync-lamp {
+        width: 100%;
+        height: 1;
+        text-align: center;
+        margin-bottom: 1;
     }
 
     #diff-actions Button {
-        margin: 0 1;
+        width: 100%;
+        margin: 0 0 1 0;
     }
 
     #diff-status {
@@ -292,11 +393,34 @@ class GlcApp(App):
     #confirm-buttons Button {
         margin: 0 1;
     }
+
+    EditModal {
+        align: center middle;
+    }
+
+    #edit-dialog {
+        width: 90%;
+        height: 90%;
+        border: round $accent;
+        background: $surface;
+    }
+
+    #edit-title {
+        height: 1;
+        background: $surface-darken-1;
+        padding: 0 1;
+    }
+
+    #edit-area {
+        height: 1fr;
+    }
     """
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
+        Binding("e", "edit", "Edit"),
+        Binding("s", "sync_scroll", "Sync scroll"),
     ]
 
     TITLE = "glc"
@@ -313,6 +437,7 @@ class GlcApp(App):
         self._gitlab_file: Path | None = None
         self._current_env: str | None = None
         self._remote_cache: dict[str, str] = {}
+        self._area_env: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -357,7 +482,28 @@ class GlcApp(App):
             return
         env_file = self._gitlab_file.parent / f"{env_name}.env"
         local = env_file.read_text() if env_file.exists() else ""
-        self.query_one(DiffPane).show_diff(local, remote)
+        preserve = env_name == self._area_env
+        self._area_env = env_name
+        self.query_one(DiffPane).show_diff(local, remote, preserve_scroll=preserve)
+
+    # ─── Edit action ─────────────────────────────────────────────────────────
+
+    def action_edit(self) -> None:
+        env = self._current_env
+        if not env or not self._gitlab_file:
+            return
+        env_file = self._gitlab_file.parent / f"{env}.env"
+        content = env_file.read_text() if env_file.exists() else ""
+
+        def done(result: str | None) -> None:
+            if result is not None:
+                env_file.write_text(result)
+                self._remote_cache.pop(env, None)
+                self._load_diff(env)
+
+        self.push_screen(EditModal(content, env), done)
+
+    # ─── HTTP workers ────────────────────────────────────────────────────────
 
     @work(thread=True)
     def _fetch_worker(self, env_name: str) -> None:
@@ -397,6 +543,10 @@ class GlcApp(App):
             self._confirm_push()
         elif event.button.id == "pull-btn":
             self._confirm_pull()
+        elif event.button.id == "edit-btn":
+            self.action_edit()
+        elif event.button.id == "sync-btn":
+            self.action_sync_scroll()
         elif event.button.id == "reload-btn":
             self.action_refresh()
 
@@ -505,6 +655,9 @@ class GlcApp(App):
         pane.set_status(event.message, ok=event.success)
         if event.success and self._current_env:
             self._fetch_worker(self._current_env)
+
+    def action_sync_scroll(self) -> None:
+        self.query_one(DiffPane).toggle_sync()
 
     def action_refresh(self) -> None:
         self._remote_cache.clear()
