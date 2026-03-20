@@ -1,6 +1,6 @@
 [project]
 name = "glc"
-version = "0.2.2"
+version = "0.2.3"
 description = "GitLab CI/CD variables manager"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -23,7 +23,7 @@ build-backend = "hatchling.build"
 
 
 [tool.bumpversion]
-current_version = "0.2.2"
+current_version = "0.2.3"
 commit = true
 tag = true
 message = "Bump version: {current_version} → {new_version}"
