@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import subprocess
 from pathlib import Path
 
 import requests
@@ -13,7 +14,17 @@ from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widget import Widget
-from textual.widgets import Button, Footer, Header, Label, RichLog, Static, TextArea, Tree
+from textual.widgets import (
+    Button,
+    Footer,
+    Header,
+    Label,
+    RichLog,
+    Static,
+    TabPane,
+    TabbedContent,
+    Tree,
+)
 
 
 # ─── Sync-aware RichLog ───────────────────────────────────────────────────────
@@ -98,33 +109,6 @@ class ConfirmModal(ModalScreen[bool]):
 # ─── Edit Modal ──────────────────────────────────────────────────────────────
 
 
-class EditModal(ModalScreen[str | None]):
-    BINDINGS = [
-        Binding("ctrl+s", "save", "Save"),
-        Binding("escape", "cancel", "Cancel"),
-    ]
-
-    def __init__(self, content: str, env_name: str) -> None:
-        super().__init__()
-        self._content = content
-        self._env_name = env_name
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="edit-dialog"):
-            yield Label(f"  {self._env_name}.env  [ctrl+s] save  [esc] cancel", id="edit-title")
-            yield TextArea(id="edit-area")
-
-    def on_mount(self) -> None:
-        area = self.query_one("#edit-area", TextArea)
-        area.load_text(self._content)
-        area.focus()
-
-    def action_save(self) -> None:
-        self.dismiss(self.query_one("#edit-area", TextArea).text)
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
-
 
 # ─── File Tree Pane ──────────────────────────────────────────────────────────
 
@@ -137,6 +121,7 @@ class FileTreePane(Widget):
         self.load_from(Path.cwd())
 
     def load_from(self, root: Path) -> None:
+        self._env_nodes: dict[Path, object] = {}
         tree = self.query_one(Tree)
         tree.clear()
         tree.root.set_label(root.name or str(root))
@@ -148,6 +133,17 @@ class FileTreePane(Widget):
             return
         self._build(tree.root, root, gitlab_dirs)
         tree.root.expand()
+
+    def update_badge(self, env_file: Path, n_issues: int) -> None:
+        """Set the tree node label to show a warning badge if n_issues > 0."""
+        node = self._env_nodes.get(env_file)
+        if node is None:
+            return
+        name = env_file.stem
+        if n_issues > 0:
+            node.set_label(f"{name} [yellow]⚠{n_issues}[/yellow]")  # type: ignore[union-attr]
+        else:
+            node.set_label(name)  # type: ignore[union-attr]
 
     # ── scanning ─────────────────────────────────────────────────────────────
 
@@ -204,7 +200,10 @@ class FileTreePane(Widget):
 
     def _add_envs(self, node: object, project_dir: Path) -> None:
         for env_file in sorted(project_dir.glob("*.env")):
-            node.add_leaf(env_file.stem, data=env_file)  # type: ignore[union-attr]
+            if env_file.name.startswith("."):
+                continue
+            leaf = node.add_leaf(env_file.stem, data=env_file)  # type: ignore[union-attr]
+            self._env_nodes[env_file] = leaf
 
 
 # ─── Diff Pane ───────────────────────────────────────────────────────────────
@@ -219,12 +218,13 @@ class DiffPane(Widget):
         with Horizontal(id="diff-cols"):
             yield SyncableLog(id="local-log", highlight=False, markup=True)
             with Vertical(id="diff-actions"):
-                yield Static("●", id="sync-lamp")
-                yield Button("→ push", id="push-btn", variant="success", disabled=True)
+                yield Static("SYNCED", id="sync-lamp")
+                yield Button("push →", id="push-btn", variant="success", disabled=True)
                 yield Button("← pull", id="pull-btn", variant="primary", disabled=True)
-                yield Button("✎ edit", id="edit-btn", variant="default")
-                yield Button("⇕ sync", id="sync-btn", variant="default")
-                yield Button("⟳ reload", id="reload-btn", variant="default")
+                yield Button("edit", id="edit-btn", variant="default")
+                yield Button("fmt", id="fmt-btn", variant="default")
+                yield Button("sync", id="sync-btn", variant="default")
+                yield Button("reload", id="reload-btn", variant="default")
             yield SyncableLog(id="remote-log", highlight=False, markup=True)
         yield Static("", id="diff-status")
 
@@ -320,7 +320,7 @@ class DiffPane(Widget):
         self.query_one("#push-btn", Button).disabled = not has_diff
         self.query_one("#pull-btn", Button).disabled = not has_diff
         self.query_one("#sync-lamp", Static).update(
-            "[red]●[/red]" if has_diff else "[green]●[/green]"
+            "[bold red]DIFF[/bold red]" if has_diff else "[bold green]SYNCED[/bold green]"
         )
 
         if has_diff:
@@ -344,7 +344,7 @@ class DiffPane(Widget):
         self._remote.loading = False
         self._local.clear()
         self._remote.clear()
-        self.query_one("#sync-lamp", Static).update("[red]●[/red]")
+        self.query_one("#sync-lamp", Static).update("[bold red]ERROR[/bold red]")
         self.query_one("#diff-status", Static).update(f"  [red]{text}[/red]")
         self.query_one("#push-btn", Button).disabled = True
         self.query_one("#pull-btn", Button).disabled = True
@@ -352,6 +352,42 @@ class DiffPane(Widget):
     def set_status(self, text: str, ok: bool = True) -> None:
         colour = "green" if ok else "red"
         self.query_one("#diff-status", Static).update(f"  [{colour}]{text}[/{colour}]")
+
+
+# ─── Template Pane ────────────────────────────────────────────────────────────
+
+
+class TemplatePane(Widget):
+    def compose(self) -> ComposeResult:
+        yield Label("", id="template-title")
+        yield RichLog(id="lint-log", markup=True)
+
+    def load(self, gitlab_file: Path) -> None:
+        template_path = gitlab_file.parent / ".glc-template.env"
+        exists = template_path.exists()
+        suffix = "" if exists else "  [dim](not yet created)[/dim]"
+        self.query_one("#template-title", Label).update(f"  {template_path.name}{suffix}")
+
+    def show_lint(
+        self,
+        env_name: str,
+        template_keys: list[str],
+        missing: list[str],
+        extra: list[str],
+    ) -> None:
+        log = self.query_one("#lint-log", RichLog)
+        log.clear()
+        missing_set = set(missing)
+        for key in template_keys:
+            if key in missing_set:
+                log.write(f"[red]✗ {key}[/red]")
+            else:
+                log.write(f"[green]✓ {key}[/green]")
+        for key in extra:
+            log.write(f"[yellow]+ {key}[/yellow]")
+
+    def clear_lint(self) -> None:
+        self.query_one("#lint-log", RichLog).clear()
 
 
 # ─── Main App ─────────────────────────────────────────────────────────────────
@@ -379,6 +415,7 @@ class GlcApp(App):
 
     DiffPane {
         width: 1fr;
+        height: 1fr;
     }
 
     #diff-cols-header {
@@ -392,7 +429,7 @@ class GlcApp(App):
     }
 
     #center-header {
-        width: 14;
+        width: 16;
     }
 
     #diff-cols {
@@ -408,7 +445,7 @@ class GlcApp(App):
     }
 
     #diff-actions {
-        width: 14;
+        width: 16;
         border-left: solid $accent;
         border-right: solid $accent;
         align: center middle;
@@ -419,12 +456,14 @@ class GlcApp(App):
         width: 100%;
         height: 1;
         text-align: center;
+        text-style: bold;
         margin-bottom: 1;
     }
 
     #diff-actions Button {
         width: 100%;
         margin: 0 0 1 0;
+        padding: 0 1;
     }
 
     #diff-status {
@@ -474,13 +513,52 @@ class GlcApp(App):
     #edit-area {
         height: 1fr;
     }
+
+    TemplatePane {
+        width: 1fr;
+        height: 1fr;
+    }
+
+    #template-header {
+        height: 1;
+        background: $surface-darken-1;
+    }
+
+    #template-title {
+        height: 1;
+        background: $surface-darken-1;
+        padding: 0 1;
+    }
+
+    #lint-log {
+        width: 1fr;
+        height: 1fr;
+    }
+
+    #right-tabs {
+        width: 1fr;
+    }
+
+    #right-tabs TabPane {
+        padding: 0;
+    }
+
+    #tab-diff {
+        padding: 0;
+    }
+
+    #tab-template {
+        padding: 0;
+    }
     """
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
         Binding("e", "edit", "Edit"),
+        Binding("o", "open_editor", "Open template"),
         Binding("s", "sync_scroll", "Sync scroll"),
+        Binding("t", "switch_tab", "Template"),
     ]
 
     TITLE = "glc"
@@ -503,7 +581,11 @@ class GlcApp(App):
         yield Header()
         with Horizontal(id="main"):
             yield FileTreePane(id="file-tree-pane")
-            yield DiffPane(id="diff-pane")
+            with TabbedContent(id="right-tabs"):
+                with TabPane("Diff", id="tab-diff"):
+                    yield DiffPane(id="diff-pane")
+                with TabPane("Template", id="tab-template"):
+                    yield TemplatePane(id="template-pane")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -521,8 +603,10 @@ class GlcApp(App):
             self._remote_cache.clear()
             self._area_env = None
             self._gitlab_file = gitlab_file
+            self._run_lint_badges()
         self._current_env = env_file.stem
         self._load_diff(env_file.stem)
+        self._update_lint(env_file.stem)
 
     def _load_diff(self, env_name: str) -> None:
         if env_name in self._remote_cache:
@@ -540,6 +624,109 @@ class GlcApp(App):
         self._area_env = env_name
         self.query_one(DiffPane).show_diff(local, remote, preserve_scroll=preserve)
 
+    # ─── Lint helpers ─────────────────────────────────────────────────────────
+
+    def _update_lint(self, env_name: str) -> None:
+        """Update the TemplatePane lint log for the given env (runs on main thread)."""
+        from glc.cli import _parse_template, _lint_env
+
+        gitlab_file = self._gitlab_file
+        if gitlab_file is None:
+            return
+        template_path = gitlab_file.parent / ".glc-template.env"
+        if not template_path.exists():
+            self.query_one(TemplatePane).clear_lint()
+            return
+        env_file = gitlab_file.parent / f"{env_name}.env"
+        if not env_file.exists():
+            self.query_one(TemplatePane).clear_lint()
+            return
+        try:
+            template_keys = _parse_template(template_path)
+            missing, extra = _lint_env(env_file, template_keys)
+            self.query_one(TemplatePane).show_lint(env_name, template_keys, missing, extra)
+        except Exception:
+            self.query_one(TemplatePane).clear_lint()
+
+    @work(thread=True)
+    def _run_lint_badges(self) -> None:
+        """Background worker: compute lint badges for all .env files in the project."""
+        from glc.cli import _parse_template, _lint_env
+
+        gitlab_file = self._gitlab_file
+        if gitlab_file is None:
+            return
+        template_path = gitlab_file.parent / ".glc-template.env"
+        if not template_path.exists():
+            return
+        try:
+            template_keys = _parse_template(template_path)
+        except Exception:
+            return
+        for env_file in sorted(gitlab_file.parent.glob("*.env")):
+            try:
+                missing, extra = _lint_env(env_file, template_keys)
+                n_issues = len(missing) + len(extra)
+                self.call_from_thread(
+                    self.query_one(FileTreePane).update_badge, env_file, n_issues
+                )
+            except Exception:
+                pass
+
+    # ─── Tab switching ────────────────────────────────────────────────────────
+
+    def action_switch_tab(self) -> None:
+        tabs = self.query_one(TabbedContent)
+        active = tabs.active
+        if active == "tab-diff":
+            tabs.active = "tab-template"
+        else:
+            tabs.active = "tab-diff"
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        if event.pane is not None and event.pane.id == "tab-template":
+            if self._gitlab_file is not None:
+                self.query_one(TemplatePane).load(self._gitlab_file)
+                if self._current_env:
+                    self._update_lint(self._current_env)
+
+    def _open_template_in_editor(self) -> None:
+        if self._gitlab_file is None:
+            return
+        template_path = self._gitlab_file.parent / ".glc-template.env"
+        editor = os.environ.get("EDITOR", "vim")
+        with self.suspend():
+            subprocess.run([editor, str(template_path)])
+        self.query_one(TemplatePane).load(self._gitlab_file)
+        if self._current_env:
+            self._update_lint(self._current_env)
+            self._run_lint_badges()
+
+    # ─── Format action ───────────────────────────────────────────────────────
+
+    def _action_format(self) -> None:
+        from glc.cli import _reorder_env
+
+        env = self._current_env
+        gitlab_file = self._gitlab_file
+        if not env or not gitlab_file:
+            return
+        template_path = gitlab_file.parent / ".glc-template.env"
+        if not template_path.exists():
+            self.query_one(DiffPane).set_status("no template found", ok=False)
+            return
+        env_file = gitlab_file.parent / f"{env}.env"
+        if not env_file.exists():
+            return
+        try:
+            reordered = _reorder_env(env_file, template_path)
+            env_file.write_text(reordered)
+            self._remote_cache.pop(env, None)
+            self._load_diff(env)
+            self._update_lint(env)
+        except Exception as exc:
+            self.query_one(DiffPane).set_status(str(exc), ok=False)
+
     # ─── Edit action ─────────────────────────────────────────────────────────
 
     def action_edit(self) -> None:
@@ -547,15 +734,12 @@ class GlcApp(App):
         if not env or not self._gitlab_file:
             return
         env_file = self._gitlab_file.parent / f"{env}.env"
-        content = env_file.read_text() if env_file.exists() else ""
-
-        def done(result: str | None) -> None:
-            if result is not None:
-                env_file.write_text(result)
-                self._remote_cache.pop(env, None)
-                self._load_diff(env)
-
-        self.push_screen(EditModal(content, env), done)
+        editor = os.environ.get("EDITOR", "vim")
+        with self.suspend():
+            subprocess.run([editor, str(env_file)])
+        self._remote_cache.pop(env, None)
+        self._load_diff(env)
+        self._update_lint(env)
 
     # ─── HTTP workers ────────────────────────────────────────────────────────
 
@@ -599,6 +783,8 @@ class GlcApp(App):
             self._confirm_pull()
         elif event.button.id == "edit-btn":
             self.action_edit()
+        elif event.button.id == "fmt-btn":
+            self._action_format()
         elif event.button.id == "sync-btn":
             self.action_sync_scroll()
         elif event.button.id == "reload-btn":
@@ -709,6 +895,9 @@ class GlcApp(App):
         pane.set_status(event.message, ok=event.success)
         if event.success and self._current_env:
             self._fetch_worker(self._current_env)
+
+    def action_open_editor(self) -> None:
+        self._open_template_in_editor()
 
     def action_sync_scroll(self) -> None:
         self.query_one(DiffPane).toggle_sync()

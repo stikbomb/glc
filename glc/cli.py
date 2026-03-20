@@ -87,18 +87,27 @@ def _parse_env_dict(env_path: Path) -> dict[str, str]:
     return result
 
 
-def _reorder_env(env_path: Path, template_keys: list[str]) -> str:
-    """Returns env content with keys ordered as in the template; extras appended."""
+def _reorder_env(env_path: Path, template_path: Path) -> str:
+    """Returns env content structured like the template (comments/blanks preserved); extras appended."""
     env_dict = _parse_env_dict(env_path)
-    ordered = []
-    for key in template_keys:
-        if key in env_dict:
-            ordered.append(env_dict[key])
-    template_set = set(template_keys)
-    extra = [line for key, line in env_dict.items() if key not in template_set]
+    used: set[str] = set()
+    lines: list[str] = []
+    for raw in template_path.read_text().splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            lines.append(raw)
+        else:
+            key = stripped.split("=", 1)[0]
+            if key in env_dict:
+                lines.append(env_dict[key])
+                used.add(key)
+            # missing keys are skipped (not added with empty value)
+    extra = [line for key, line in env_dict.items() if key not in used]
     if extra:
-        ordered.extend(extra)
-    return "\n".join(ordered) + "\n"
+        if lines and lines[-1] != "":
+            lines.append("")
+        lines.extend(extra)
+    return "\n".join(lines) + "\n"
 
 
 def _lint_env(env_path: Path, template_keys: list[str]) -> tuple[list[str], list[str]]:
@@ -324,7 +333,7 @@ def push(
             if not yes and not typer.confirm("continue anyway?"):
                 typer.echo("aborted")
                 raise typer.Exit(0)
-        reordered = _reorder_env(env_file, template_keys)
+        reordered = _reorder_env(env_file, template_path)
         if reordered != local_value:
             env_file.write_text(reordered)
             local_value = reordered
