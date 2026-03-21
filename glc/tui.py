@@ -360,13 +360,28 @@ class DiffPane(Widget):
 class TemplatePane(Widget):
     def compose(self) -> ComposeResult:
         yield Label("", id="template-title")
-        yield RichLog(id="lint-log", markup=True)
+        with Horizontal(id="template-cols"):
+            yield RichLog(id="template-log", highlight=False, markup=True)
+            yield RichLog(id="lint-log", markup=True)
 
     def load(self, gitlab_file: Path) -> None:
         template_path = gitlab_file.parent / ".glc-template.env"
-        exists = template_path.exists()
-        suffix = "" if exists else "  [dim](not yet created)[/dim]"
-        self.query_one("#template-title", Label).update(f"  {template_path.name}{suffix}")
+        tlog = self.query_one("#template-log", RichLog)
+        tlog.clear()
+        if template_path.exists():
+            self.query_one("#template-title", Label).update(f"  {template_path.name}")
+            for line in template_path.read_text().splitlines():
+                stripped = line.strip()
+                if not stripped:
+                    tlog.write("")
+                elif stripped.startswith("#"):
+                    tlog.write(f"[dim]{line}[/dim]")
+                else:
+                    tlog.write(line)
+        else:
+            self.query_one("#template-title", Label).update(
+                f"  {template_path.name}  [dim](not yet created)[/dim]"
+            )
 
     def show_lint(
         self,
@@ -530,9 +545,17 @@ class GlcApp(App):
         padding: 0 1;
     }
 
-    #lint-log {
-        width: 1fr;
+    #template-cols {
         height: 1fr;
+    }
+
+    #template-log {
+        width: 1fr;
+        border-right: solid $accent;
+    }
+
+    #lint-log {
+        width: 30;
     }
 
     #right-tabs {
