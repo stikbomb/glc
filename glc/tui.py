@@ -133,6 +133,22 @@ class FileTreePane(Widget):
             return
         self._build(tree.root, root, gitlab_dirs)
         tree.root.expand()
+        self.styles.width = self._calc_width(root, gitlab_dirs)
+
+    def _calc_width(self, root: Path, gitlab_dirs: list[Path]) -> int:
+        max_len = len(root.name or str(root))
+        for gd in gitlab_dirs:
+            try:
+                rel = gd.relative_to(root)
+            except ValueError:
+                continue
+            depth = len(rel.parts)
+            for i, part in enumerate(rel.parts):
+                max_len = max(max_len, len(part) + 2 * (i + 1))
+            for env_file in gd.glob("*.env"):
+                if not env_file.name.startswith("."):
+                    max_len = max(max_len, len(env_file.stem) + 2 * (depth + 1))
+        return max(20, min(max_len + 5, 60))
 
     def update_badge(self, env_file: Path, n_issues: int) -> None:
         """Set the tree node label to show a warning badge if n_issues > 0."""
